@@ -60,7 +60,7 @@ folder_paths.folder_names_and_paths["xlabs_flux_json"] = ([dir_xlabs_flux], set(
 
 
 
-from .sampling import get_noise, prepare, get_schedule, denoise, denoise_controlnet, unpack
+from .sampling import get_noise, prepare, get_schedule, denoise_multistep, denoise_euler, denoise_rk2, denoise_rk4, denoise_controlnet, unpack
 import numpy as np
 
 def load_flux_lora(path):
@@ -319,21 +319,23 @@ class XlabsSampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                    "model": ("MODEL",),
-                    "conditioning": ("CONDITIONING",),
-                    "neg_conditioning": ("CONDITIONING",),
-                    "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                    "steps": ("INT",  {"default": 20, "min": 1, "max": 100}),
-                    "timestep_to_start_cfg": ("INT",  {"default": 20, "min": 0, "max": 100}),
-                    "true_gs": ("FLOAT",  {"default": 3, "min": 0, "max": 100}),
-                    "image_to_image_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                    "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                },
+                "model": ("MODEL",),
+                "conditioning": ("CONDITIONING",),
+                "neg_conditioning": ("CONDITIONING",),
+                "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
+                "timestep_to_start_cfg": ("INT", {"default": 20, "min": 0, "max": 100}),
+                "true_gs": ("FLOAT", {"default": 3, "min": 0, "max": 100}),
+                "image_to_image_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "sampler": ("STRING", {"default": "euler", "choices": ["euler", "rk2", "rk4", "multi-step"],
+                }),
+            },
             "optional": {
-                    "latent_image": ("LATENT", {"default": None}),
-                    "controlnet_condition": ("ControlNetCondition", {"default": None}),
-                }
+                "latent_image": ("LATENT", {"default": None}),
+                "controlnet_condition": ("ControlNetCondition", {"default": None}),
             }
+        }
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
     FUNCTION = "sampling"
@@ -341,48 +343,43 @@ class XlabsSampler:
 
     def sampling(self, model, conditioning, neg_conditioning,
                  noise_seed, steps, timestep_to_start_cfg, true_gs,
-                 image_to_image_strength, denoise_strength,
-                 latent_image=None, controlnet_condition=None
-                 ):
+                 image_to_image_strength, denoise_strength, sampler,
+                 latent_image=None, controlnet_condition=None):
         additional_steps = 11 if controlnet_condition is None else 12
         mm.load_model_gpu(model)
         inmodel = model.model
-        #print(conditioning[0][0].shape) #//t5
-        #print(conditioning[0][1]['pooled_output'].shape) #//clip
-        #print(latent_image['samples'].shape) #// torch.Size([1, 4, 64, 64]) // bc, 4, w//8, h//8
         try:
             guidance = conditioning[0][1]['guidance']
         except:
             guidance = 1.0
 
-        device=mm.get_torch_device()
+        device = mm.get_torch_device()
         if torch.backends.mps.is_available():
             device = torch.device("mps")
         if torch.cuda.is_bf16_supported():
             dtype_model = torch.bfloat16
         else:
             dtype_model = torch.float16
-        #dtype_model = torch.bfloat16#model.model.diffusion_model.img_in.weight.dtype
-        offload_device=mm.unet_offload_device()
+
+        offload_device = mm.unet_offload_device()
 
         torch.manual_seed(noise_seed)
 
         bc, c, h, w = latent_image['samples'].shape
-        height = (h//2) * 16
-        width = (w//2) * 16
+        height = (h // 2) * 16
+        width = (w // 2) * 16
 
         x = get_noise(
             bc, height, width, device=device,
             dtype=dtype_model, seed=noise_seed
         )
         orig_x = None
-        if c==16:
-            orig_x=latent_image['samples']
+        if c == 16:
+            orig_x = latent_image['samples']
             lat_processor2 = LATENT_PROCESSOR_COMFY()
-            orig_x=lat_processor2.go_back(orig_x)
-            orig_x=orig_x.to(device, dtype=dtype_model)
+            orig_x = lat_processor2.go_back(orig_x)
+            orig_x = orig_x.to(device, dtype=dtype_model)
 
-        
         timesteps = get_schedule(
             steps,
             (width // 8) * (height // 8) // 4,
@@ -393,22 +390,35 @@ class XlabsSampler:
         except:
             pass
         x.to(device)
-        
+
         inmodel.diffusion_model.to(device)
         inp_cond = prepare(conditioning[0][0], conditioning[0][1]['pooled_output'], img=x)
         neg_inp_cond = prepare(neg_conditioning[0][0], neg_conditioning[0][1]['pooled_output'], img=x)
 
-        if denoise_strength<=0.99:
+        if denoise_strength <= 0.99:
             try:
-                timesteps=timesteps[:int(len(timesteps)*denoise_strength)]
+                timesteps = timesteps[:int(len(timesteps) * denoise_strength)]
             except:
                 pass
-        # for sampler preview
+        # For sampler preview
         x0_output = {}
         callback = latent_preview.prepare_callback(model, len(timesteps) - 1, x0_output)
 
+        # Select the appropriate denoise function based on the sampler parameter
+        if sampler == 'euler':
+            denoise_fn = denoise_euler
+        elif sampler == 'rk2':
+            denoise_fn = denoise_rk2
+        elif sampler == 'rk4':
+            denoise_fn = denoise_rk4
+        elif sampler == 'multi-step':
+            denoise_fn = denoise_multistep
+        else:
+            # Default to initial method if unknown
+            denoise_fn = denoise_euler
+
         if controlnet_condition is None:
-            x = denoise(
+            x = denoise_fn(
                 inmodel.diffusion_model, **inp_cond, timesteps=timesteps, guidance=guidance,
                 timestep_to_start_cfg=timestep_to_start_cfg,
                 neg_txt=neg_inp_cond['txt'],
@@ -423,66 +433,38 @@ class XlabsSampler:
             )
 
         else:
-            def prepare_controlnet_condition(controlnet_condition):
-                controlnet = controlnet_condition['model']
-                controlnet_image = controlnet_condition['img']
-                controlnet_image = torch.nn.functional.interpolate(
-                    controlnet_image, size=(height, width), scale_factor=None, mode='bicubic',)
-                controlnet_strength = controlnet_condition['controlnet_strength']
-                controlnet_start = controlnet_condition['start']
-                controlnet_end = controlnet_condition['end']
-                controlnet.to(device, dtype=dtype_model)
-                controlnet_image=controlnet_image.to(device, dtype=dtype_model)
-                return {
-                    "img": controlnet_image,
-                    "controlnet_strength": controlnet_strength,
-                    "model": controlnet,
-                    "start": controlnet_start,
-                    "end": controlnet_end,
-                }
-
-
-            cnet_conditions = [prepare_controlnet_condition(el) for el in controlnet_condition]
-            containers = []
-            for el in cnet_conditions:
-                start_step = int(el['start']*len(timesteps))
-                end_step = int(el['end']*len(timesteps))
-                container = ControlNetContainer(el['model'], el['img'], el['controlnet_strength'], start_step, end_step)
-                containers.append(container)
-
+            controlnet = controlnet_condition['model']
+            controlnet_image = controlnet_condition['img']
+            controlnet_image = torch.nn.functional.interpolate(
+                controlnet_image, size=(height, width), scale_factor=None, mode='bicubic',)
+            controlnet_strength = controlnet_condition['controlnet_strength']
+            controlnet.to(device, dtype=dtype_model)
+            controlnet_image = controlnet_image.to(device, dtype=dtype_model)
             mm.load_models_gpu([model,])
-            #mm.load_model_gpu(controlnet)
-
-            total_steps = len(timesteps)
-
             x = denoise_controlnet(
-                inmodel.diffusion_model, **inp_cond, 
-                controlnets_container=containers,
+                inmodel.diffusion_model, **inp_cond, controlnet=controlnet,
                 timesteps=timesteps, guidance=guidance,
-                #controlnet_cond=controlnet_image,
+                controlnet_cond=controlnet_image,
                 timestep_to_start_cfg=timestep_to_start_cfg,
                 neg_txt=neg_inp_cond['txt'],
                 neg_txt_ids=neg_inp_cond['txt_ids'],
                 neg_vec=neg_inp_cond['vec'],
                 true_gs=true_gs,
-                #controlnet_gs=controlnet_strength,
+                controlnet_gs=controlnet_strength,
                 image2image_strength=image_to_image_strength,
                 orig_image=orig_x,
                 callback=callback,
                 width=width,
                 height=height,
-                #controlnet_start_step=start_step,
-                #controlnet_end_step=end_step
             )
-            #controlnet.to(offload_device)
 
         x = unpack(x, height, width)
         lat_processor = LATENT_PROCESSOR_COMFY()
         x = lat_processor(x)
         lat_ret = {"samples": x}
 
-        #model.model.to(offload_device)
         return (lat_ret,)
+
 
 
 

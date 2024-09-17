@@ -147,7 +147,496 @@ def get_schedule(
     return timesteps.tolist()
 
 
-def denoise(
+## Multi-step
+def denoise_multistep(
+    model,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    neg_txt: Tensor,
+    neg_txt_ids: Tensor,
+    neg_vec: Tensor,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    true_gs=1,
+    timestep_to_start_cfg=0,
+    image2image_strength=None,
+    orig_image=None,
+    callback=None,
+    width=512,
+    height=512,
+):
+    i = 0
+
+    if image2image_strength is not None and orig_image is not None:
+        t_idx = int((1 - np.clip(image2image_strength, 0.0, 1.0)) * len(timesteps))
+        t = timesteps[t_idx]
+        timesteps = timesteps[t_idx:]
+        orig_image = rearrange(orig_image, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2).to(img.device, dtype=img.dtype)
+        img = t * img + (1.0 - t) * orig_image
+
+    img_ids = img_ids.to(img.device, dtype=img.dtype)
+    txt = txt.to(img.device, dtype=img.dtype)
+    txt_ids = txt_ids.to(img.device, dtype=img.dtype)
+    vec = vec.to(img.device, dtype=img.dtype)
+
+    if hasattr(model, "guidance_in"):
+        guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    else:
+        guidance_vec = None  # Ignored for models without guidance
+
+    total_steps = len(timesteps) - 1
+    pred_n_minus1 = None  # To store v_{n-1}
+    pred_n = None         # To store v_n
+
+    for idx, (t_curr, t_prev) in enumerate(tqdm(zip(timesteps[:-1], timesteps[1:]), desc="Sampling", total=total_steps)):
+        h = t_prev - t_curr  # Time step size (negative for reverse time)
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+
+        if idx == 0:
+            # First step: use RK4 to initialize
+            # --- RK4 Implementation ---
+            # k1
+            pred1 = model_forward(
+                model,
+                img=img,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+            )
+            if i >= timestep_to_start_cfg:
+                neg_pred1 = model_forward(
+                    model,
+                    img=img,
+                    img_ids=img_ids,
+                    txt=neg_txt,
+                    txt_ids=neg_txt_ids,
+                    y=neg_vec,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                    neg_mode=True,
+                )
+                pred1 = neg_pred1 + true_gs * (pred1 - neg_pred1)
+
+            # k2
+            img_k2 = img + (h / 2) * pred1
+            t_mid = t_curr + (h / 2)
+            t_mid_vec = torch.full((img.shape[0],), t_mid, dtype=img.dtype, device=img.device)
+            pred2 = model_forward(
+                model,
+                img=img_k2,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_mid_vec,
+                guidance=guidance_vec,
+            )
+            if i >= timestep_to_start_cfg:
+                neg_pred2 = model_forward(
+                    model,
+                    img=img_k2,
+                    img_ids=img_ids,
+                    txt=neg_txt,
+                    txt_ids=neg_txt_ids,
+                    y=neg_vec,
+                    timesteps=t_mid_vec,
+                    guidance=guidance_vec,
+                    neg_mode=True,
+                )
+                pred2 = neg_pred2 + true_gs * (pred2 - neg_pred2)
+
+            # k3
+            img_k3 = img + (h / 2) * pred2
+            pred3 = model_forward(
+                model,
+                img=img_k3,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_mid_vec,
+                guidance=guidance_vec,
+            )
+            if i >= timestep_to_start_cfg:
+                neg_pred3 = model_forward(
+                    model,
+                    img=img_k3,
+                    img_ids=img_ids,
+                    txt=neg_txt,
+                    txt_ids=neg_txt_ids,
+                    y=neg_vec,
+                    timesteps=t_mid_vec,
+                    guidance=guidance_vec,
+                    neg_mode=True,
+                )
+                pred3 = neg_pred3 + true_gs * (pred3 - neg_pred3)
+
+            # k4
+            img_k4 = img + h * pred3
+            t_prev_vec = torch.full((img.shape[0],), t_prev, dtype=img.dtype, device=img.device)
+            pred4 = model_forward(
+                model,
+                img=img_k4,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_prev_vec,
+                guidance=guidance_vec,
+            )
+            if i >= timestep_to_start_cfg:
+                neg_pred4 = model_forward(
+                    model,
+                    img=img_k4,
+                    img_ids=img_ids,
+                    txt=neg_txt,
+                    txt_ids=neg_txt_ids,
+                    y=neg_vec,
+                    timesteps=t_prev_vec,
+                    guidance=guidance_vec,
+                    neg_mode=True,
+                )
+                pred4 = neg_pred4 + true_gs * (pred4 - neg_pred4)
+
+            # Update img
+            img = img + (h / 6) * (pred1 + 2 * pred2 + 2 * pred3 + pred4)
+
+            # Initialize velocities for multistep method
+            pred_n_minus1 = pred1  # v_{n-1}
+            pred_n = pred4         # v_n
+
+        else:
+            # Predictor: 2-step Adams-Bashforth
+            img_predict = img + h * (1.5 * pred_n - 0.5 * pred_n_minus1)
+
+            # Compute v_{n+1}^{predict}
+            t_prev_vec = torch.full((img.shape[0],), t_prev, dtype=img.dtype, device=img.device)
+            pred_np1_predict = model_forward(
+                model,
+                img=img_predict,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_prev_vec,
+                guidance=guidance_vec,
+            )
+            if i >= timestep_to_start_cfg:
+                neg_pred_np1_predict = model_forward(
+                    model,
+                    img=img_predict,
+                    img_ids=img_ids,
+                    txt=neg_txt,
+                    txt_ids=neg_txt_ids,
+                    y=neg_vec,
+                    timesteps=t_prev_vec,
+                    guidance=guidance_vec,
+                    neg_mode=True,
+                )
+                pred_np1_predict = neg_pred_np1_predict + true_gs * (pred_np1_predict - neg_pred_np1_predict)
+
+            # Corrector: 2-step Adams-Moulton
+            img = img + h * (0.5 * pred_np1_predict + 0.5 * pred_n)
+
+            # Update velocities for next step
+            pred_n_minus1 = pred_n
+            pred_n = pred_np1_predict
+
+        if callback is not None:
+            unpacked = unpack(img.float(), height, width)
+            callback(step=i, x=img, x0=unpacked, total_steps=total_steps)
+        i += 1
+
+    return img
+
+## RK4
+def denoise_rk4(
+    model,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    neg_txt: Tensor,
+    neg_txt_ids: Tensor,
+    neg_vec: Tensor,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    true_gs=1,
+    timestep_to_start_cfg=0,
+    image2image_strength=None,
+    orig_image=None,
+    callback=None,
+    width=512,
+    height=512,
+):
+    i = 0
+
+    if image2image_strength is not None and orig_image is not None:
+        t_idx = int((1 - np.clip(image2image_strength, 0.0, 1.0)) * len(timesteps))
+        t = timesteps[t_idx]
+        timesteps = timesteps[t_idx:]
+        orig_image = rearrange(orig_image, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2).to(img.device, dtype=img.dtype)
+        img = t * img + (1.0 - t) * orig_image
+
+    img_ids = img_ids.to(img.device, dtype=img.dtype)
+    txt = txt.to(img.device, dtype=img.dtype)
+    txt_ids = txt_ids.to(img.device, dtype=img.dtype)
+    vec = vec.to(img.device, dtype=img.dtype)
+
+    if hasattr(model, "guidance_in"):
+        guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    else:
+        guidance_vec = None  # Ignored for models without guidance
+
+    total_steps = len(timesteps) - 1
+    for t_curr, t_prev in tqdm(zip(timesteps[:-1], timesteps[1:]), desc="Sampling", total=total_steps):
+        h = t_prev - t_curr  # Time step size (negative for reverse time)
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+
+        # k1
+        pred1 = model_forward(
+            model,
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+        )
+        if i >= timestep_to_start_cfg:
+            neg_pred1 = model_forward(
+                model,
+                img=img,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred1 = neg_pred1 + true_gs * (pred1 - neg_pred1)
+
+        # k2
+        img_k2 = img + (h / 2) * pred1
+        t_mid1 = t_curr + (h / 2)
+        t_mid1_vec = torch.full((img.shape[0],), t_mid1, dtype=img.dtype, device=img.device)
+        pred2 = model_forward(
+            model,
+            img=img_k2,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_mid1_vec,
+            guidance=guidance_vec,
+        )
+        if i >= timestep_to_start_cfg:
+            neg_pred2 = model_forward(
+                model,
+                img=img_k2,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_mid1_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred2 = neg_pred2 + true_gs * (pred2 - neg_pred2)
+
+        # k3
+        img_k3 = img + (h / 2) * pred2
+        t_mid2 = t_curr + (h / 2)
+        t_mid2_vec = torch.full((img.shape[0],), t_mid2, dtype=img.dtype, device=img.device)
+        pred3 = model_forward(
+            model,
+            img=img_k3,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_mid2_vec,
+            guidance=guidance_vec,
+        )
+        if i >= timestep_to_start_cfg:
+            neg_pred3 = model_forward(
+                model,
+                img=img_k3,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_mid2_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred3 = neg_pred3 + true_gs * (pred3 - neg_pred3)
+
+        # k4
+        img_k4 = img + h * pred3
+        t_prev_vec = torch.full((img.shape[0],), t_prev, dtype=img.dtype, device=img.device)
+        pred4 = model_forward(
+            model,
+            img=img_k4,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_prev_vec,
+            guidance=guidance_vec,
+        )
+        if i >= timestep_to_start_cfg:
+            neg_pred4 = model_forward(
+                model,
+                img=img_k4,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_prev_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred4 = neg_pred4 + true_gs * (pred4 - neg_pred4)
+
+        # Combine slopes to update img
+        img = img + (h / 6) * (pred1 + 2 * pred2 + 2 * pred3 + pred4)
+
+        if callback is not None:
+            unpacked = unpack(img.float(), height, width)
+            callback(step=i, x=img, x0=unpacked, total_steps=total_steps)
+        i += 1
+
+    return img
+
+## RK2-Heun's method
+def denoise_rk2(
+    model,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    neg_txt: Tensor,
+    neg_txt_ids: Tensor,
+    neg_vec: Tensor,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    true_gs=1,
+    timestep_to_start_cfg=0,
+    image2image_strength=None,
+    orig_image=None,
+    callback=None,
+    width=512,
+    height=512,
+):
+    i = 0
+
+    if image2image_strength is not None and orig_image is not None:
+        t_idx = int((1 - np.clip(image2image_strength, 0.0, 1.0)) * len(timesteps))
+        t = timesteps[t_idx]
+        timesteps = timesteps[t_idx:]
+        orig_image = rearrange(orig_image, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2).to(img.device, dtype=img.dtype)
+        img = t * img + (1.0 - t) * orig_image
+
+    img_ids = img_ids.to(img.device, dtype=img.dtype)
+    txt = txt.to(img.device, dtype=img.dtype)
+    txt_ids = txt_ids.to(img.device, dtype=img.dtype)
+    vec = vec.to(img.device, dtype=img.dtype)
+    prev_pred = torch.zeros_like(img)
+
+    if hasattr(model, "guidance_in"):
+        guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    else:
+        guidance_vec = None  # Ignored for models without guidance
+
+    for t_curr, t_prev in tqdm(zip(timesteps[:-1], timesteps[1:]), desc="Sampling", total=len(timesteps) - 1):
+        h = t_prev - t_curr  # Time step size
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+
+        # Compute k1 (initial slope)
+        pred1 = model_forward(
+            model,
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+        )
+
+        if i >= timestep_to_start_cfg:
+            neg_pred1 = model_forward(
+                model,
+                img=img,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred1 = neg_pred1 + true_gs * (pred1 - neg_pred1)
+
+        # Estimate img at t_prev using Euler step
+        img_temp = img + h * pred1
+
+        # Compute k2 (slope at the end)
+        t_prev_vec = torch.full((img.shape[0],), t_prev, dtype=img.dtype, device=img.device)
+        pred2 = model_forward(
+            model,
+            img=img_temp,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_prev_vec,
+            guidance=guidance_vec,
+        )
+
+        if i >= timestep_to_start_cfg:
+            neg_pred2 = model_forward(
+                model,
+                img=img_temp,
+                img_ids=img_ids,
+                txt=neg_txt,
+                txt_ids=neg_txt_ids,
+                y=neg_vec,
+                timesteps=t_prev_vec,
+                guidance=guidance_vec,
+                neg_mode=True,
+            )
+            pred2 = neg_pred2 + true_gs * (pred2 - neg_pred2)
+
+        # Update img using the average slope
+        img = img + (h / 2) * (pred1 + pred2)
+
+        if callback is not None:
+            unpacked = unpack(img.float(), height, width)
+            callback(step=i, x=img, x0=unpacked, total_steps=len(timesteps) - 1)
+        i += 1
+
+    return img
+
+# Euler (initial)
+def denoise_euler(
     model,
     # model input
     img: Tensor,
